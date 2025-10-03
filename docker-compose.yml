@@ -4,26 +4,8 @@ services:
     container_name: vulnscanner_web
     command: python manage.py runserver 0.0.0.0:8000
     volumes:
-      - .:/app  # Sync code changes live!
+      - .:/app
     ports:
       - "8000:8000"
     env_file:
       - .env
-    depends_on:
-      - db  # wait for database before launching
-
-  db:  # 🐘 PostgreSQL database
-    image: postgres:15
-    container_name: vulnscanner_db
-    restart: always
-    environment:
-      POSTGRES_DB: vulnscanner_db
-      POSTGRES_USER: sara
-      POSTGRES_PASSWORD: 1234
-    volumes:
-      - postgres_data:/var/lib/postgresql/data  # Keep data even if container stops
-    ports:
-      - "5432:5432"  # Optional: allows connecting via pgAdmin or DBeaver
-
-volumes:
-  postgres_data:
