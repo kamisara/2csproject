@@ -1,3 +1,15 @@
+# apps/scans_app/utils/scanner.py
+"""
+Legit lightweight scanner:
+- TCP connect scan of a small, safe port list
+- Minimal banner grab
+- HTTP HEAD/GET for basic metadata + headers
+- TLS certificate info (days left, SANs, issuer)
+- Optional CVE suggestions via providers (best-effort, informational)
+
+All network activity is read-only & non-intrusive.
+"""
+from __future__ import annotations
 import socket
 import ssl
 import re
@@ -7,6 +19,8 @@ from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+
+from .cve_providers import query_cves_for_product_version
 
 # ---------- Config ----------
 TCP_TIMEOUT = 2.0
@@ -20,7 +34,6 @@ TOP_PORTS_FULL = [
     3389,5900,8080,8081,8443,3306,9200,27017
 ]
 
-# best-effort mapping for 'service' field
 PORT_SERVICE = {
     21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
     80: "http", 110: "pop3", 135: "msrpc", 139: "netbios-ssn",
@@ -30,33 +43,33 @@ PORT_SERVICE = {
     9200: "elasticsearch", 27017: "mongodb"
 }
 
-# Example fingerprint index (string containment → “possible CVEs”)
-SAMPLE_VULN_INDEX = {
-    "OpenSSH": ["CVE-2018-15473"],
-    "nginx": ["CVE-2019-20372"],
-    "Apache": ["CVE-2021-41773"],
-    "OpenSSL": ["CVE-2022-3602"]
-}
-
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
+# Basic product/version heuristics
+# Examples:
+#   "Server: nginx/1.23.4"      -> ("nginx", "1.23.4")
+#   "Apache/2.4.57 (Ubuntu)"    -> ("Apache", "2.4.57")
+#   "OpenSSH_8.9p1 Ubuntu-3"    -> ("OpenSSH", "8.9p1")
+#   "gunicorn/19.9.0"           -> ("gunicorn", "19.9.0")
+PRODUCT_PATTERNS = [
+    re.compile(r"(nginx)[/\- ](?P<ver>\d+(\.\d+){0,3})", re.I),
+    re.compile(r"(apache)[/\- ](?P<ver>\d+(\.\d+){0,3})", re.I),
+    re.compile(r"(httpd)[/\- ](?P<ver>\d+(\.\d+){0,3})", re.I),
+    re.compile(r"(openssh)[_/ ](?P<ver>\d+[^\s/]*)", re.I),
+    re.compile(r"(openssl)[/\- ](?P<ver>\d+(\.\d+){0,3}[a-z]?)", re.I),
+    re.compile(r"(gunicorn)[/\- ](?P<ver>\d+(\.\d+){0,3})", re.I),
+    re.compile(r"(mysql)[/\- ](?P<ver>\d+(\.\d+){0,3})", re.I),
+    re.compile(r"(postgresql)[/\- ](?P<ver>\d+(\.\d+){0,3})", re.I),
+]
 
-# ---------- Helpers ----------
 
 def _normalize_target(target: str) -> Tuple[str, str]:
-    """
-    Returns (host, base_url)
-      - host: 'example.com'
-      - base_url: 'https://example.com' or 'http://example.com' if scheme present;
-                  otherwise 'http://<host>' (we prefer http for first probe)
-    """
     t = target.strip()
-    if t.startswith("http://") or t.startswith("https://"):
+    if t.startswith(("http://", "https://")):
         p = urlparse(t)
         host = p.netloc.split("/", 1)[0]
         scheme = p.scheme
         return host, f"{scheme}://{host}"
-    # raw host/IP/CIDR (CIDR is not expanded here; caller provides single target)
     return t, f"http://{t}"
 
 
@@ -69,9 +82,6 @@ def _tcp_connect(host: str, port: int, timeout: float = TCP_TIMEOUT) -> bool:
 
 
 def _banner_grab(host: str, port: int, timeout: float = TCP_TIMEOUT) -> Optional[str]:
-    """
-    Minimal, safe banner attempt: connect, send CRLF, read up to 1KB.
-    """
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -101,10 +111,6 @@ def _http_session() -> requests.Session:
 
 
 def _http_basic_checks(session: requests.Session, base_url: str) -> Dict[str, Any]:
-    """
-    HEAD (follow redirects), then GET if HEAD not enough or content is HTML.
-    Collects status_code, server header, title, robots presence, HSTS, CSP, cookie flags.
-    """
     out: Dict[str, Any] = {
         "status": None,
         "title": None,
@@ -120,8 +126,6 @@ def _http_basic_checks(session: requests.Session, base_url: str) -> Dict[str, An
         out["status"] = r.status_code
         out["server"] = r.headers.get("Server")
         out["redirect_chain"] = [h.url for h in r.history] if r.history else []
-        # security headers from the final response
-        # HSTS header name is Strict-Transport-Security (case-insensitive)
         out["hsts"] = any(h.lower() == "strict-transport-security" for h in r.headers.keys())
         out["csp"] = r.headers.get("Content-Security-Policy")
 
@@ -135,7 +139,7 @@ def _http_basic_checks(session: requests.Session, base_url: str) -> Dict[str, An
             if m:
                 out["title"] = re.sub(r"\s+", " ", m.group(1).strip())
 
-            # robots.txt
+            # robots.txt presence
             robots_url = base_url.rstrip("/") + "/robots.txt"
             try:
                 rr = session.get(robots_url, timeout=HTTP_TIMEOUT, verify=True)
@@ -143,7 +147,7 @@ def _http_basic_checks(session: requests.Session, base_url: str) -> Dict[str, An
             except Exception:
                 out["robots"] = None
 
-            # Set-Cookie flags (very crude)
+            # Set-Cookie flags (crude)
             set_cookie_headers = g.headers.get("Set-Cookie", "")
             flags = []
             if "HttpOnly" in set_cookie_headers:
@@ -153,7 +157,7 @@ def _http_basic_checks(session: requests.Session, base_url: str) -> Dict[str, An
             out["cookie_flags"] = flags
 
     except requests.RequestException:
-        # try plain HTTP if HTTPS failed and scheme not enforced
+        # try plain HTTP if HTTPS fails and scheme is https
         if base_url.startswith("https://"):
             try:
                 http_url = "http://" + base_url.split("://", 1)[1]
@@ -173,16 +177,13 @@ def _http_basic_checks(session: requests.Session, base_url: str) -> Dict[str, An
 
 
 def _tls_cert_info(host: str, port: int = 443, timeout: float = TCP_TIMEOUT) -> Optional[Dict[str, Any]]:
-    """
-    Pull server certificate and compute days_left/valid.
-    """
     try:
         ctx = ssl.create_default_context()
         with ctx.wrap_socket(socket.socket(socket.AF_INET), server_hostname=host) as s:
             s.settimeout(timeout)
             s.connect((host, port))
             cert = s.getpeercert()
-        # Parse dates like 'Oct  1 12:00:00 2025 GMT'
+
         def _parse_dt(x: Optional[str]) -> Optional[datetime]:
             if not x:
                 return None
@@ -218,15 +219,25 @@ def _tls_cert_info(host: str, port: int = 443, timeout: float = TCP_TIMEOUT) -> 
         return None
 
 
-def _simple_vuln_lookup(text: Optional[str]) -> List[str]:
+def _extract_product_version(text: Optional[str]) -> Optional[Tuple[str, Optional[str]]]:
+    """
+    Try several patterns to find (product, version) in banners / server headers.
+    """
     if not text:
-        return []
-    t = text.lower()
-    out: List[str] = []
-    for k, cves in SAMPLE_VULN_INDEX.items():
-        if k.lower() in t:
-            out.extend(cves)
-    return out
+        return None
+    t = text.strip()
+    for pat in PRODUCT_PATTERNS:
+        m = pat.search(t)
+        if m:
+            prod = m.group(1)
+            ver = m.group("ver")
+            return (prod, ver)
+    # Fallback: product without version
+    tokens = re.split(r"[ /()_;\-]", t)
+    for tok in tokens:
+        if tok and tok.isalpha() and len(tok) > 2:
+            return (tok, None)
+    return None
 
 
 def _scan_port_worker(host: str, port: int) -> Dict[str, Any]:
@@ -244,23 +255,23 @@ def _scan_port_worker(host: str, port: int) -> Dict[str, Any]:
 
 def run_scan(scan_id: int, target: str, mode: str) -> Dict[str, Any]:
     """
-    Returns dict with keys expected by tasks.py:
-      - open_ports: List[ {port, service, state, banner} ]
+    Return dict consumed by tasks.py:
+      - open_ports: [ {port, service, state, banner} ]
       - http_info:  {status, title, server, hsts, csp, robots, cookie_flags, redirect_chain}
       - tls_info:   {issuer, subject, sans, valid_from, valid_to, days_left, valid}
-      - vulnerabilities: [] or best-effort matches (only in 'full')
+      - vulnerabilities: [ {severity, name, path, description, impact, remediation, reference_links} ]
     """
     host, base_url = _normalize_target(target)
     ports = TOP_PORTS_QUICK if mode == "quick" else TOP_PORTS_FULL
 
-    # 1) Port scan (threaded)
+    # 1) Port scan
     open_ports: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(ports)))) as pool:
         futures = {pool.submit(_scan_port_worker, host, p): p for p in ports}
         for fut in as_completed(futures):
             open_ports.append(fut.result())
 
-    # 2) HTTP checks (only if 80/443 open)
+    # 2) HTTP checks
     http_info: Dict[str, Any] = {}
     try:
         has_http = any(p["port"] == 80 and p["state"] == "open" for p in open_ports)
@@ -281,31 +292,54 @@ def run_scan(scan_id: int, target: str, mode: str) -> Dict[str, Any]:
     # 3) TLS cert info
     tls_info = _tls_cert_info(host, 443) if any(p["port"] == 443 and p["state"] == "open" for p in open_ports) else {}
 
-    # 4) Basic vuln lookup (string fingerprints)
-    matches: List[str] = []
+    # 4) CVE suggestions (best-effort)
+    # Collect product/version candidates from banners & server header
+    candidates: List[Tuple[str, Optional[str]]] = []
+
+    # From port banners
     for p in open_ports:
         if p.get("banner"):
-            matches.extend(_simple_vuln_lookup(p["banner"]))
-    if http_info.get("server"):
-        matches.extend(_simple_vuln_lookup(http_info["server"]))
-    matches = sorted(set(matches))
+            pv = _extract_product_version(p["banner"])
+            if pv:
+                candidates.append(pv)
 
-    # For 'full' mode, surface these as “possible” findings (non-exploitative)
+    # From HTTP server header
+    if http_info.get("server"):
+        pv = _extract_product_version(http_info["server"])
+        if pv:
+            candidates.append(pv)
+
+    # Deduplicate (product,version)
+    seen = set()
+    unique_candidates: List[Tuple[str, Optional[str]]] = []
+    for prod, ver in candidates:
+        k = (prod.lower(), (ver or "").lower())
+        if k not in seen:
+            seen.add(k)
+            unique_candidates.append((prod, ver))
+
+    # Query providers and build informational findings (only in full mode)
     vulnerabilities: List[Dict[str, Any]] = []
     if mode == "full":
-        for cve in matches:
-            # Convert a fingerprint match into a harmless, informational entry
-            # (Your UI labels this as “possible” and advises verification)
-            vul_name = f"Possible exposure: {cve}"
-            vulnerabilities.append({
-                "severity": "low",
-                "name": vul_name,
-                "path": "/",
-                "description": f"Service fingerprint suggests potential relevance of {cve}. Manual verification required.",
-                "impact": "May indicate outdated or vulnerable software version.",
-                "remediation": "Verify software version; if affected, update to a patched release.",
-                "reference_links": [f"https://cve.mitre.org/cgi-bin/cvename.cgi?name={cve}"],
-            })
+        for prod, ver in unique_candidates:
+            try:
+                cves = query_cves_for_product_version(prod, ver)
+            except Exception:
+                cves = []
+            for cve in cves:
+                vulnerabilities.append({
+                    "severity": "low",  # policy: CVE hint = low until confirmed/version precise
+                    "name": f"Possible exposure: {cve}",
+                    "path": "/",
+                    "description": (
+                        f"Service fingerprint suggests {prod}"
+                        + (f" {ver}" if ver else "")
+                        + f" may be affected by {cve}. Manual verification required."
+                    ),
+                    "impact": "May indicate outdated or vulnerable software version.",
+                    "remediation": "Verify software version; if affected, update to a patched release.",
+                    "reference_links": [f"https://cve.mitre.org/cgi-bin/cvename.cgi?name={cve}"],
+                })
 
     return {
         "open_ports": open_ports,
