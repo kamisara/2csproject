@@ -1,9 +1,36 @@
-import React from "react";
-import { Navigate, Outlet, Route } from "react-router-dom";
+"use client";
+import React, { useEffect, useState } from "react";
+import { Navigate, Outlet } from "react-router-dom";
 
 export default function ProtectedRoute() {
-  // ✅ Replace this with your actual authentication check
-  const isAuthenticated = localStorage.getItem("authToken"); // or your own logic
+  const [isLoading, setIsLoading] = useState(true);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
 
-  return isAuthenticated ? <Route /> : <Navigate to="/login" replace />;
+  useEffect(() => {
+    const checkAuth = async () => {
+      try {
+        const res = await fetch("http://127.0.0.1:8000/profile", {
+          method: "GET",
+          credentials: "include", // important for Django session
+        });
+
+        if (res.ok) {
+          setIsAuthenticated(true);
+        } else {
+          setIsAuthenticated(false);
+        }
+      } catch (err) {
+        console.error(err);
+        setIsAuthenticated(false);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    checkAuth();
+  }, []);
+
+  if (isLoading) return <p>Loading...</p>; // Wait until auth check completes
+
+  return isAuthenticated ? <Outlet /> : <Navigate to="/login" replace />;
 }

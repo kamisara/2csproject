@@ -29,3 +29,5 @@ tzdata==2025.2
 Pillow>=10.0
 
 weasyprint==62.3
+
+django-cors-headers

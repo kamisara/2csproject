@@ -5,7 +5,7 @@ import History from "../pages/History";
 import AboutUs from "../pages/AboutUs";
 import Profile from "../pages/Profile";
 import LoginSignup from "../pages/LoginSignup";
-import ProtectedRoute from "../components/ProtectedRoute"; // ✅ Import this
+import ProtectedRoute from "./ProtectedRoute"; // ✅ Import this
 
 export default function AppRoutes() {
   return (

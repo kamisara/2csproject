@@ -1,6 +1,7 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
+import { useNavigate } from "react-router-dom"
 
 export default function NewScanPage() {
   const [scanType, setScanType] = useState("quick")
@@ -11,68 +12,191 @@ export default function NewScanPage() {
   const [error, setError] = useState("")
   const [userName, setUserName] = useState("UserName")
   const [scanComplete, setScanComplete] = useState(false)
+  const [currentScan, setCurrentScan] = useState(null)
+  const [recentScans, setRecentScans] = useState([])
+  const navigate = useNavigate()
+  const API_BASE_URL = "http://127.0.0.1:8000"
 
+  // Track if cancel was requested to prevent polling interference
+  const cancelRequestedRef = useRef(false)
+
+  // Fetch user data and recent scans
   useEffect(() => {
-    const userData = localStorage.getItem("userData")
-    if (userData) {
-      const parsedData = JSON.parse(userData)
-      setUserName(parsedData.fullName || parsedData.name || "UserName")
-    }
-  }, [])
-
-  useEffect(() => {
-    if (isScanning) {
-      const progressInterval = setInterval(() => {
-        setProgress((prev) => {
-          const newProgress = prev + 1
-          if (newProgress >= 100) {
-            clearInterval(progressInterval)
-            return 100
-          }
-          return newProgress
+    const fetchUserAndScans = async () => {
+      try {
+        // Fetch user profile
+        const profileRes = await fetch(`${API_BASE_URL}/profile`, {
+          method: "GET",
+          credentials: "include",
         })
-      }, 300)
+        
+        if (profileRes.ok) {
+          const profileData = await profileRes.json()
+          setUserName(`${profileData.user.firstName} ${profileData.user.lastName}` || "UserName")
+        }
 
-      const timeInterval = setInterval(() => {
-        setEstimatedTime((prev) => {
-          if (prev <= 0) {
-            clearInterval(timeInterval)
-            return 0
-          }
-          return prev - 1
+        // Fetch recent scans
+        const scansRes = await fetch(`${API_BASE_URL}/scans?limit=5`, {
+          method: "GET",
+          credentials: "include",
         })
-      }, 1000)
-
-      return () => {
-        clearInterval(progressInterval)
-        clearInterval(timeInterval)
+        
+        if (scansRes.ok) {
+          const scansData = await scansRes.json()
+          setRecentScans(scansData.scans || [])
+        }
+      } catch (err) {
+        console.error("Error fetching data:", err)
       }
     }
-  }, [isScanning])
 
+    fetchUserAndScans()
+  }, [])
+
+  // Poll for scan progress
   useEffect(() => {
-    if (progress >= 100 && isScanning) {
-      console.log("[v0] Scan complete! Setting scanComplete to true")
-      setIsScanning(false)
-      setScanComplete(true)
-    }
-  }, [progress, isScanning])
+    let interval
+    if (isScanning && currentScan) {
+      // Reset cancel flag when starting new scan
+      cancelRequestedRef.current = false
+      
+      interval = setInterval(async () => {
+        try {
+          // Stop polling immediately if cancel was requested
+          if (cancelRequestedRef.current) {
+            clearInterval(interval)
+            return
+          }
 
-  const handleStartScan = () => {
+          const scanId = currentScan.scanId.replace('s_', '')
+          const res = await fetch(`${API_BASE_URL}/scans/${scanId}`, {
+            method: "GET",
+            credentials: "include",
+          })
+          
+          if (res.ok) {
+            const scanData = await res.json()
+            
+            // Update progress
+            setProgress(scanData.progress || 0)
+            
+            if (scanData.estimatedTimeLeft) {
+              setEstimatedTime(scanData.estimatedTimeLeft)
+            }
+            
+            // Check if scan is complete
+            if (scanData.status === "completed") {
+              setIsScanning(false)
+              setScanComplete(true)
+              setProgress(100)
+              clearInterval(interval)
+              
+              // Refresh recent scans
+              const scansRes = await fetch(`${API_BASE_URL}/scans?limit=5`, {
+                method: "GET",
+                credentials: "include",
+              })
+              if (scansRes.ok) {
+                const scansData = await scansRes.json()
+                setRecentScans(scansData.scans || [])
+              }
+            } else if (scanData.status === "failed" || scanData.status === "canceled") {
+              setIsScanning(false)
+              setError(`Scan ${scanData.status}`)
+              clearInterval(interval)
+              setCurrentScan(null)
+            }
+          }
+        } catch (err) {
+          console.error("Error polling scan status:", err)
+        }
+      }, 2000)
+    }
+
+    return () => {
+      if (interval) clearInterval(interval)
+    }
+  }, [isScanning, currentScan])
+
+  const handleStartScan = async () => {
     if (!url.trim()) {
-      setError("Please enter a valid URL or IP address")
+      setError("Please enter a valid URL, IP address, or CIDR range")
       return
     }
+
     setError("")
     setIsScanning(true)
     setProgress(0)
-    setEstimatedTime(30)
+    setEstimatedTime(scanType === "quick" ? 30 : 120)
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/scans`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          target: url.trim(),
+          mode: scanType,
+        }),
+      })
+
+      const responseData = await res.json()
+      
+      if (!res.ok) {
+        throw new Error(responseData?.error?.message || "Failed to start scan")
+      }
+
+      setCurrentScan(responseData)
+      setError("")
+    } catch (err) {
+      console.error("Error starting scan:", err)
+      setError(err.message || "Failed to start scan")
+      setIsScanning(false)
+    }
   }
 
-  const handleCancelScan = () => {
-    setIsScanning(false)
-    setProgress(0)
-    setEstimatedTime(30)
+  const handleCancelScan = async () => {
+    if (!currentScan) return
+
+    try {
+      // Set cancel flag immediately to stop polling
+      cancelRequestedRef.current = true
+
+      const scanId = currentScan.scanId.replace('s_', '')
+      const res = await fetch(`${API_BASE_URL}/scans/${scanId}/cancel`, {
+        method: "POST",
+        credentials: "include",
+      })
+
+      if (!res.ok) {
+        const errorData = await res.json()
+        throw new Error(errorData?.error?.message || "Failed to cancel scan")
+      }
+
+      // Immediately update UI state
+      setIsScanning(false)
+      setProgress(0)
+      setEstimatedTime(30)
+      setCurrentScan(null)
+      setError("Scan cancelled successfully")
+      
+      // Refresh recent scans
+      const scansRes = await fetch(`${API_BASE_URL}/scans?limit=5`, {
+        method: "GET",
+        credentials: "include",
+      })
+      if (scansRes.ok) {
+        const scansData = await scansRes.json()
+        setRecentScans(scansData.scans || [])
+      }
+    } catch (err) {
+      console.error("Error cancelling scan:", err)
+      setError(err.message || "Failed to cancel scan")
+      // Even if API call fails, reset the UI state
+      setIsScanning(false)
+      setCurrentScan(null)
+      cancelRequestedRef.current = false
+    }
   }
 
   const handleScanAgain = () => {
@@ -82,6 +206,61 @@ export default function NewScanPage() {
     setEstimatedTime(30)
     setUrl("")
     setError("")
+    setCurrentScan(null)
+    cancelRequestedRef.current = false
+  }
+
+  const handleViewReport = (scanId) => {
+    const numericScanId = scanId.replace('s_', '')
+    navigate(`/scans/${numericScanId}`)
+  }
+
+  const handleDownloadReport = async (scanId, format = "pdf") => {
+    try {
+      const numericScanId = scanId.replace('s_', '')
+      const res = await fetch(`${API_BASE_URL}/scans/${numericScanId}/download?format=${format}`, {
+        method: "GET",
+        credentials: "include",
+      })
+
+      if (!res.ok) {
+        const errorData = await res.json()
+        throw new Error(errorData?.detail || "Failed to download report")
+      }
+
+      // Handle different response types
+      if (format === "json") {
+        const data = await res.json()
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" })
+        const url = window.URL.createObjectURL(blob)
+        const link = document.createElement("a")
+        link.href = url
+        link.download = `scan_${scanId}_report.json`
+        link.click()
+        window.URL.revokeObjectURL(url)
+      } else if (format === "html") {
+        const html = await res.text()
+        const blob = new Blob([html], { type: "text/html" })
+        const url = window.URL.createObjectURL(blob)
+        const link = document.createElement("a")
+        link.href = url
+        link.download = `scan_${scanId}_report.html`
+        link.click()
+        window.URL.revokeObjectURL(url)
+      } else {
+        // PDF
+        const blob = await res.blob()
+        const url = window.URL.createObjectURL(blob)
+        const link = document.createElement("a")
+        link.href = url
+        link.download = `scan_${scanId}_report.pdf`
+        link.click()
+        window.URL.revokeObjectURL(url)
+      }
+    } catch (err) {
+      console.error("Error downloading report:", err)
+      setError(err.message || "Failed to download report")
+    }
   }
 
   const formatTime = (seconds) => {
@@ -90,8 +269,22 @@ export default function NewScanPage() {
     return `${mins} minute${mins !== 1 ? "s" : ""} ${secs} second${secs !== 1 ? "s" : ""}`
   }
 
-  if (scanComplete) {
-    console.log("[v0] Rendering success screen")
+  const getStatusColor = (status) => {
+    switch (status) {
+      case "completed": return "text-green-400"
+      case "running": return "text-blue-400"
+      case "queued": return "text-yellow-400"
+      case "failed": return "text-red-400"
+      case "canceled": return "text-gray-400"
+      default: return "text-gray-400"
+    }
+  }
+
+  const formatDate = (dateString) => {
+    return new Date(dateString).toLocaleDateString()
+  }
+
+  if (scanComplete && currentScan) {
     return (
       <div className="bg-[#0D1B2A] min-h-screen">
         <div className="text-[#F4F4F4]">
@@ -130,15 +323,26 @@ export default function NewScanPage() {
                 <h1 className="text-3xl font-bold text-white text-center">Scan Completed Successfully!</h1>
               </div>
 
-              {/* View Scan Report Button */}
-              <button className="mb-8 rounded-lg bg-red-500 px-8 py-3 font-semibold text-white hover:bg-red-600 transition-all shadow-lg shadow-red-500/30">
-                View Scan Report
-              </button>
+              {/* Action Buttons */}
+              <div className="flex gap-4 mb-8">
+                <button 
+                  onClick={() => handleViewReport(currentScan.scanId)}
+                  className="rounded-lg bg-red-500 px-8 py-3 font-semibold text-white hover:bg-red-600 transition-all shadow-lg shadow-red-500/30"
+                >
+                  View Scan Report
+                </button>
+                <button 
+                  onClick={() => handleDownloadReport(currentScan.scanId, "pdf")}
+                  className="rounded-lg border border-[#34D399] px-6 py-3 font-semibold text-[#34D399] hover:bg-[#34D399]/10 transition-all"
+                >
+                  Download PDF
+                </button>
+              </div>
 
               {/* Scan Details */}
               <div className="text-center text-gray-400 mb-4">
-                <p className="font-medium">VulnerabilityAlert Found: 3</p>
-                <p className="text-sm">8 minutes 17 seconds</p>
+                <p className="font-medium">Target: {currentScan.target}</p>
+                <p className="text-sm">Mode: {currentScan.mode}</p>
               </div>
 
               <button
@@ -153,33 +357,55 @@ export default function NewScanPage() {
           {/* Recent Scans Section */}
           <div className="mx-auto max-w-7xl px-6 pb-16">
             <h2 className="text-2xl font-bold mb-6">Recent Scans</h2>
-            <div className="rounded-2xl bg-[#142D4C] border border-[#1F3B5A] p-6">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-6 flex-1">
-                  <div className="flex items-center justify-center h-12 w-12 rounded-full bg-[#34D399]/20 ring-4 ring-[#34D399]/30">
-                    <svg
-                      className="h-6 w-6 text-[#34D399]"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                    >
-                      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-                      <path d="M9 12l2 2 4-4" />
-                    </svg>
+            <div className="space-y-4">
+              {recentScans.map((scan) => (
+                <div key={scan.scanId} className="rounded-2xl bg-[#142D4C] border border-[#1F3B5A] p-6">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-6 flex-1">
+                      <div className={`flex items-center justify-center h-12 w-12 rounded-full ${
+                        scan.status === "completed" ? "bg-[#34D399]/20 ring-4 ring-[#34D399]/30" :
+                        scan.status === "running" ? "bg-blue-500/20 ring-4 ring-blue-500/30" :
+                        "bg-gray-500/20 ring-4 ring-gray-500/30"
+                      }`}>
+                        <svg
+                          className={`h-6 w-6 ${
+                            scan.status === "completed" ? "text-[#34D399]" :
+                            scan.status === "running" ? "text-blue-500" :
+                            "text-gray-500"
+                          }`}
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                        >
+                          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                          {scan.status === "completed" && <path d="M9 12l2 2 4-4" />}
+                        </svg>
+                      </div>
+                      <div>
+                        <span className="font-medium block">{scan.target}</span>
+                        <span className="text-sm text-gray-400 capitalize">{scan.mode} scan</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-6 flex-1">
+                      <span className="text-gray-400">{formatDate(scan.createdAt)}</span>
+                    </div>
+                    <div className="flex items-center gap-6 flex-1 justify-end">
+                      <span className={`capitalize ${getStatusColor(scan.status)}`}>
+                        {scan.status}
+                      </span>
+                      {scan.status === "completed" && (
+                        <button 
+                          onClick={() => handleViewReport(scan.scanId)}
+                          className="rounded-lg border border-[#1F3B5A] px-6 py-2 text-sm font-medium hover:bg-[#34D399]/10 hover:border-[#34D399] transition-all"
+                        >
+                          View Report
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <span className="font-medium">Bloggersite.net</span>
                 </div>
-                <div className="flex items-center gap-6 flex-1">
-                  <span className="text-gray-400">2023-10-29</span>
-                </div>
-                <div className="flex items-center gap-6 flex-1 justify-end">
-                  <span className="text-gray-400">Completed</span>
-                  <button className="rounded-lg border border-[#1F3B5A] px-6 py-2 text-sm font-medium hover:bg-[#34D399]/10 hover:border-[#34D399] transition-all">
-                    View Log
-                  </button>
-                </div>
-              </div>
+              ))}
             </div>
           </div>
         </div>
@@ -190,6 +416,17 @@ export default function NewScanPage() {
   return (
     <div className="bg-[#0D1B2A] min-h-screen">
       <div className="text-[#F4F4F4]">
+        {/* Error Message */}
+        {error && (
+          <div className={`fixed top-5 left-1/2 -translate-x-1/2 px-6 py-3 rounded-lg shadow-lg z-50 ${
+            error.includes("Error") || error.includes("Failed") 
+              ? "bg-red-500 text-white" 
+              : "bg-[#34D399] text-white"
+          }`}>
+            {error}
+          </div>
+        )}
+
         {/* Hero Section */}
         <div className="mx-auto max-w-7xl px-6 py-16">
           <div className="flex items-center justify-between gap-12">
@@ -229,7 +466,7 @@ export default function NewScanPage() {
                 {/* Scanning Text - RIGHT SIDE */}
                 <div className="flex-1">
                   <h1 className="text-5xl font-bold mb-4">Scanning in progress...</h1>
-                  <p className="text-gray-400 text-lg mb-8">Uncover key Scan and inspections flaws.</p>
+                  <p className="text-gray-400 text-lg mb-8">Uncover key vulnerabilities and security flaws.</p>
 
                   <div className="space-y-4">
                     <div className="flex items-center justify-between text-sm">
@@ -249,7 +486,7 @@ export default function NewScanPage() {
               <>
                 <div className="flex-1">
                   <h1 className="text-5xl font-bold mb-4">New Scan</h1>
-                  <p className="text-gray-400 text-lg">Easily scan websites and applications for common flaws.</p>
+                  <p className="text-gray-400 text-lg">Easily scan websites and applications for common security flaws.</p>
                 </div>
 
                 {/* Right Side PC with bubbles */}
@@ -271,13 +508,13 @@ export default function NewScanPage() {
         {/* Scan Form */}
         <div className="mx-auto max-w-7xl px-6 pb-16">
           <div className="rounded-2xl bg-[#142D4C] border border-[#1F3B5A] p-8">
-            <label className="block text-sm font-medium mb-3">Enter URL or IP Address to Scan</label>
+            <label className="block text-sm font-medium mb-3">Enter URL, IP Address, or CIDR Range to Scan</label>
             <div className="flex gap-4 mb-2">
               <input
                 type="text"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
-                placeholder="e.g. https://your-website.com"
+                placeholder="e.g. https://your-website.com, 192.168.1.1, or 10.0.0.0/24"
                 disabled={isScanning}
                 className="flex-1 rounded-lg bg-[#0D1B2A] border border-[#1F3B5A] px-4 py-3 placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-[#34D399] focus:border-transparent transition-all disabled:opacity-50 disabled:cursor-not-allowed"
               />
@@ -339,33 +576,61 @@ export default function NewScanPage() {
         {/* Recent Scans */}
         <div className="mx-auto max-w-7xl px-6 pb-16">
           <h2 className="text-2xl font-bold mb-6">Recent Scans</h2>
-          <div className="rounded-2xl bg-[#142D4C] border border-[#1F3B5A] p-6">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-6 flex-1">
-                <div className="flex items-center justify-center h-12 w-12 rounded-full bg-[#34D399]/20 ring-4 ring-[#34D399]/30">
-                  <svg
-                    className="h-6 w-6 text-[#34D399]"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                  >
-                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-                    <path d="M9 12l2 2 4-4" />
-                  </svg>
+          <div className="space-y-4">
+            {recentScans.length > 0 ? (
+              recentScans.map((scan) => (
+                <div key={scan.scanId} className="rounded-2xl bg-[#142D4C] border border-[#1F3B5A] p-6">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-6 flex-1">
+                      <div className={`flex items-center justify-center h-12 w-12 rounded-full ${
+                        scan.status === "completed" ? "bg-[#34D399]/20 ring-4 ring-[#34D399]/30" :
+                        scan.status === "running" ? "bg-blue-500/20 ring-4 ring-blue-500/30" :
+                        "bg-gray-500/20 ring-4 ring-gray-500/30"
+                      }`}>
+                        <svg
+                          className={`h-6 w-6 ${
+                            scan.status === "completed" ? "text-[#34D399]" :
+                            scan.status === "running" ? "text-blue-500" :
+                            "text-gray-500"
+                          }`}
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                        >
+                          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                          {scan.status === "completed" && <path d="M9 12l2 2 4-4" />}
+                        </svg>
+                      </div>
+                      <div>
+                        <span className="font-medium block">{scan.target}</span>
+                        <span className="text-sm text-gray-400 capitalize">{scan.mode} scan</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-6 flex-1">
+                      <span className="text-gray-400">{formatDate(scan.createdAt)}</span>
+                    </div>
+                    <div className="flex items-center gap-6 flex-1 justify-end">
+                      <span className={`capitalize ${getStatusColor(scan.status)}`}>
+                        {scan.status}
+                      </span>
+                      {scan.status === "completed" && (
+                        <button 
+                          onClick={() => handleViewReport(scan.scanId)}
+                          className="rounded-lg border border-[#1F3B5A] px-6 py-2 text-sm font-medium hover:bg-[#34D399]/10 hover:border-[#34D399] transition-all"
+                        >
+                          View Report
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 </div>
-                <span className="font-medium">blogproject.net</span>
+              ))
+            ) : (
+              <div className="rounded-2xl bg-[#142D4C] border border-[#1F3B5A] p-6 text-center text-gray-400">
+                No recent scans found. Start your first scan above!
               </div>
-              <div className="flex items-center gap-6 flex-1">
-                <span className="text-gray-400">2023-10-26</span>
-              </div>
-              <div className="flex items-center gap-6 flex-1 justify-end">
-                <span className="text-gray-400">Completed</span>
-                <button className="rounded-lg border border-[#1F3B5A] px-6 py-2 text-sm font-medium hover:bg-[#34D399]/10 hover:border-[#34D399] transition-all">
-                  View Log
-                </button>
-              </div>
-            </div>
+            )}
           </div>
         </div>
       </div>
