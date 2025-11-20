@@ -513,3 +513,28 @@ class ScanDownloadView(AuthenticatedView):
         resp = HttpResponse(pdf, content_type="application/pdf")
         resp["Content-Disposition"] = f'attachment; filename="scan_report_{scan_id}.pdf"'
         return resp
+    
+from collections import Counter
+from rest_framework.decorators import api_view, permission_classes, authentication_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from .models import Vulnerability
+from apps.auth_app.authentication import CookieJWTAuthentication  # ✅ correct import
+
+@api_view(['GET'])
+@authentication_classes([CookieJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def most_common_vulns(request):
+    user = request.user
+
+    vulns = Vulnerability.objects.filter(scan__user=user)
+
+    if not vulns.exists():
+        return Response({"most_common": []}, status=200)
+
+    vuln_names = [v.name for v in vulns]
+    freq = Counter(vuln_names)
+
+    result = [{"name": name, "count": count} for name, count in freq.most_common()]
+
+    return Response({"most_common": result}, status=200)
