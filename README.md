@@ -65,8 +65,10 @@ npm install
 
 # Start development server
 npm run dev
+
+
 📁 Project Structure
-text
+
 vulnscan/
 ├── backend/                 # Django REST API
 │   ├── accounts/           # User authentication & profiles
