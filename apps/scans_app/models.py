@@ -1,4 +1,3 @@
-```python
 """
 Database models for VulnScan scanning application.
 
@@ -33,27 +32,7 @@ class Scan(models.Model):
     
     Tracks the lifecycle of a scan from creation through completion,
     including progress monitoring, timing information, and user association.
-    
-    Relationships:
-    - Many-to-One with User: Each scan belongs to a single user
-    - One-to-One with ScanResult: Detailed technical findings
-    - One-to-One with Report: Aggregated results for presentation
-    - One-to-Many with Vulnerability: Individual security issues found
-    
-    Fields:
-    - user: Owner of the scan (foreign key to User model)
-    - target: Hostname, IP address, or URL to scan
-    - mode: Scan intensity level (quick/full)
-    - status: Current state in scan lifecycle
-    - progress: Completion percentage (0-100)
-    - timing: Creation, start, and completion timestamps
-    - estimated_time_left: Human-readable time estimate
-    
-    Indexes:
-    - Automatic primary key on id
-    - Foreign key index on user_id
-    - Composite index on (user_id, created_at) for user history
-    - Index on status for filtering and monitoring
+    Each scan progresses through states: queued → running → completed/failed/canceled.
     """
     
     STATUS_CHOICES = [
@@ -63,95 +42,43 @@ class Scan(models.Model):
         ('failed', 'Failed'),
         ('canceled', 'Canceled'),
     ]
-    
-    MODE_CHOICES = [
-        ('quick', 'Quick Scan'),    # Fast scan with common ports and basic checks
-        ('full', 'Full Scan'),      # Comprehensive scan with all ports and deep analysis
-    ]
+    MODE_CHOICES = [('quick', 'Quick'), ('full', 'Full')]
 
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
-        on_delete=models.CASCADE,
-        help_text="User who initiated the scan"
-    )
+    # User relationship - each scan belongs to one user
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)  # auth_user FK
     
-    target = models.CharField(
-        max_length=255,
-        help_text="Target hostname, IP address, or URL to scan"
-    )
+    # Scan target - hostname, IP address, or URL to be scanned
+    target = models.CharField(max_length=255)
     
-    mode = models.CharField(
-        max_length=20, 
-        choices=MODE_CHOICES,
-        help_text="Scan intensity and depth level"
-    )
+    # Scan intensity level - quick for fast scans, full for comprehensive
+    mode = models.CharField(max_length=20, choices=MODE_CHOICES)
     
-    status = models.CharField(
-        max_length=20, 
-        choices=STATUS_CHOICES, 
-        default='queued',
-        help_text="Current state of the scan operation"
-    )
+    # Current state in scan lifecycle
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='queued')
     
+    # Completion percentage with validation (0-100%)
     progress = models.IntegerField(
         default=0,
-        validators=[MinValueValidator(0), MaxValueValidator(100)],
-        help_text="Scan completion percentage (0-100)"
+        validators=[MinValueValidator(0), MaxValueValidator(100)]
     )
     
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-        help_text="Timestamp when scan was created"
-    )
+    # Timestamps for tracking scan lifecycle
+    created_at = models.DateTimeField(auto_now_add=True)   # DEFAULT NOW()
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
     
-    started_at = models.DateTimeField(
-        null=True, 
-        blank=True,
-        help_text="Timestamp when scan execution began"
-    )
-    
-    finished_at = models.DateTimeField(
-        null=True, 
-        blank=True,
-        help_text="Timestamp when scan completed or failed"
-    )
-    
-    estimated_time_left = models.CharField(
-        max_length=50, 
-        null=True, 
-        blank=True,
-        help_text="Human-readable estimate of remaining scan time"
-    )
+    # Human-readable time estimate for ongoing scans
+    estimated_time_left = models.CharField(max_length=50, null=True, blank=True)
 
     def __str__(self):
-        """Human-readable representation of the scan."""
+        """Human-readable string representation for admin interface."""
         return f"[{self.id}] {self.target} ({self.mode}) - {self.status}"
 
     class Meta:
-        """Metadata options for the Scan model."""
+        """Metadata options for Scan model."""
         verbose_name = "Vulnerability Scan"
         verbose_name_plural = "Vulnerability Scans"
         ordering = ['-created_at']  # Most recent scans first
-        indexes = [
-            models.Index(fields=['user', 'created_at']),
-            models.Index(fields=['status']),
-            models.Index(fields=['created_at']),
-        ]
-
-    @property
-    def duration(self):
-        """
-        Calculate the actual or current duration of the scan.
-        
-        Returns:
-            str or None: Duration in human-readable format or None if not started
-        """
-        if not self.started_at:
-            return None
-            
-        end_time = self.finished_at or timezone.now()
-        duration = end_time - self.started_at
-        return str(duration).split('.')[0]  # Remove microseconds
 
 
 class ScanResult(models.Model):
@@ -161,67 +88,30 @@ class ScanResult(models.Model):
     Stores raw and processed scan data using PostgreSQL JSONB fields
     for flexibility in storing varying types of scan results without
     requiring schema changes for new scan types or tools.
-    
-    Relationships:
-    - One-to-One with Scan: Each scan has one set of detailed results
-    
-    JSONB Fields:
-    - open_ports: List of discovered open ports with service information
-    - http_info: HTTP service details (headers, titles, technologies)
-    - tls_info: SSL/TLS certificate and configuration details
-    - raw_output: Complete raw output from scanning tools for debugging
-    
-    Design Rationale:
-    JSONB provides schema flexibility while maintaining query performance
-    and allowing complex nested data structures from various scanning tools.
     """
     
-    scan = models.OneToOneField(
-        Scan, 
-        on_delete=models.CASCADE, 
-        related_name="result",
-        help_text="Associated scan session"
-    )
+    # One-to-one relationship with Scan - each scan has one result set
+    scan = models.OneToOneField(Scan, on_delete=models.CASCADE, related_name="result")
     
-    open_ports = models.JSONField(
-        default=list,
-        help_text="List of open ports with service details in JSON format"
-    )
+    # JSONB field for open port information with service details
+    open_ports = models.JSONField(default=list)   # [{"port":80,"service":"http","banner":"nginx"}, ...]
     
-    http_info = models.JSONField(
-        default=dict,
-        help_text="HTTP service information including headers and technologies"
-    )
+    # JSONB field for HTTP service information and headers
+    http_info = models.JSONField(default=dict)    # {"status":200,"title":"Home","server":"Apache"}
     
-    tls_info = models.JSONField(
-        default=dict,
-        help_text="TLS/SSL certificate and configuration details"
-    )
+    # JSONB field for TLS/SSL certificate and configuration details
+    tls_info = models.JSONField(default=dict)     # {"issuer":"Let's Encrypt","valid":true,...}
     
-    raw_output = models.JSONField(
-        default=dict,
-        help_text="Complete raw output from scanning tools for debugging"
-    )
+    # JSONB field for complete raw output from scanning tools
+    raw_output = models.JSONField(default=dict)   # optional raw results / debug
     
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-        help_text="Timestamp when results were first created"
-    )
-    
-    updated_at = models.DateTimeField(
-        auto_now=True,
-        help_text="Timestamp when results were last updated"
-    )
+    # Timestamps for tracking when results were created and updated
+    created_at = models.DateTimeField(auto_now_add=True)  # DEFAULT NOW()
+    updated_at = models.DateTimeField(auto_now=True)      # trigger equivalent
 
     def __str__(self):
-        """Human-readable representation of scan results."""
+        """Human-readable string representation."""
         return f"Results for Scan #{self.scan_id}"
-
-    class Meta:
-        """Metadata options for the ScanResult model."""
-        verbose_name = "Scan Result"
-        verbose_name_plural = "Scan Results"
-        db_table = 'scan_results'  # Explicit table name
 
 
 class Vulnerability(models.Model):
@@ -231,119 +121,68 @@ class Vulnerability(models.Model):
     Represents specific security issues discovered during scanning,
     with detailed information about severity, impact, and remediation.
     Supports user collaboration through notes and status tracking.
-    
-    Relationships:
-    - Many-to-One with Scan: Vulnerabilities belong to a specific scan
-    - One-to-Many with Note: Users can add annotations to vulnerabilities
-    
-    Fields:
-    - severity: Criticality level from info to critical
-    - name: Vulnerability title or CVE identifier
-    - path: Affected endpoint or component
-    - description: Technical explanation of the issue
-    - impact: Potential consequences if exploited
-    - remediation: Recommended fix or mitigation
-    - reference_links: External resources and documentation
-    - status: Tracking state (new, acknowledged, fixed)
-    - evidence: Proof or details of the finding
     """
     
     SEVERITY_CHOICES = [
-        ('info', 'Information'),
+        ('info', 'Info'),
         ('low', 'Low'),
         ('medium', 'Medium'),
         ('high', 'High'),
         ('critical', 'Critical'),
     ]
-    
     STATUS_CHOICES = [
         ('new', 'New'),
         ('acknowledged', 'Acknowledged'),
         ('fixed', 'Fixed'),
     ]
 
-    scan = models.ForeignKey(
-        Scan, 
-        on_delete=models.CASCADE, 
-        related_name="vulnerabilities",
-        help_text="Scan session where this vulnerability was found"
-    )
+    # Many-to-one relationship with Scan - vulnerabilities belong to a scan
+    scan = models.ForeignKey(Scan, on_delete=models.CASCADE, related_name="vulnerabilities")
     
-    severity = models.CharField(
-        max_length=20, 
-        choices=SEVERITY_CHOICES,
-        help_text="Criticality level of the vulnerability"
-    )
+    # Criticality level of the vulnerability for prioritization
+    severity = models.CharField(max_length=20, choices=SEVERITY_CHOICES)
     
-    name = models.CharField(
-        max_length=255,
-        help_text="Vulnerability name or CVE identifier"
-    )
+    # Vulnerability name or CVE identifier
+    name = models.CharField(max_length=255)
     
-    path = models.CharField(
-        max_length=255, 
-        null=True, 
-        blank=True,
-        help_text="Affected endpoint, URL, or component path"
-    )
+    # Affected endpoint, URL, or component path
+    path = models.CharField(max_length=255, null=True, blank=True)
     
-    description = models.TextField(
-        null=True, 
-        blank=True,
-        help_text="Technical description of the vulnerability"
-    )
+    # Technical description of the vulnerability
+    description = models.TextField(null=True, blank=True)
     
-    impact = models.TextField(
-        null=True, 
-        blank=True,
-        help_text="Potential consequences if this vulnerability is exploited"
-    )
+    # Potential consequences if exploited
+    impact = models.TextField(null=True, blank=True)
     
-    remediation = models.TextField(
-        null=True, 
-        blank=True,
-        help_text="Recommended fix or mitigation steps"
-    )
+    # Recommended fix or mitigation steps
+    remediation = models.TextField(null=True, blank=True)
     
+    # Array of reference URLs for additional information
+    # TEXT[] in SQL → ArrayField(CharField)
     reference_links = ArrayField(
         base_field=models.CharField(max_length=1024),
         default=list,
         blank=True,
-        help_text="List of reference URLs for additional information"
     )
     
-    status = models.CharField(
-        max_length=20, 
-        choices=STATUS_CHOICES, 
-        default='new',
-        help_text="Current status in the vulnerability management workflow"
-    )
+    # Current status in vulnerability management workflow
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='new')
     
-    evidence = models.TextField(
-        null=True, 
-        blank=True,
-        help_text="Technical evidence or proof of the vulnerability"
-    )
+    # Technical evidence or proof of the vulnerability
+    evidence = models.TextField(null=True, blank=True)
     
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-        help_text="Timestamp when vulnerability was recorded"
-    )
+    # Timestamp when vulnerability was recorded
+    created_at = models.DateTimeField(auto_now_add=True)  # DEFAULT NOW()
 
     def __str__(self):
-        """Human-readable representation of the vulnerability."""
+        """Human-readable string representation."""
         return f"{self.name} ({self.severity}) - Scan #{self.scan_id}"
 
     class Meta:
-        """Metadata options for the Vulnerability model."""
+        """Metadata options for Vulnerability model."""
         verbose_name = "Vulnerability"
         verbose_name_plural = "Vulnerabilities"
         ordering = ['-severity', 'name']  # Sort by severity then name
-        indexes = [
-            models.Index(fields=['scan', 'severity']),
-            models.Index(fields=['severity']),
-            models.Index(fields=['status']),
-        ]
 
 
 class Report(models.Model):
@@ -353,86 +192,42 @@ class Report(models.Model):
     Provides summarized information about a scan session suitable for
     reports, dashboards, and external sharing. Includes statistics
     and references to specific vulnerabilities.
-    
-    Relationships:
-    - One-to-One with Scan: Each scan has one report
-    
-    Fields:
-    - Vulnerability counts by severity level
-    - Duration of the scan
-    - References to specific vulnerability IDs
-    - Download link for generated report files
     """
     
-    scan = models.OneToOneField(
-        Scan, 
-        on_delete=models.CASCADE, 
-        related_name="report",
-        help_text="Associated scan session"
-    )
+    # One-to-one relationship with Scan - each scan has one report
+    scan = models.OneToOneField(Scan, on_delete=models.CASCADE, related_name="report")
     
-    total = models.IntegerField(
-        default=0,
-        help_text="Total number of vulnerabilities found"
-    )
+    # Vulnerability count statistics
+    total = models.IntegerField(default=0)
+    critical = models.IntegerField(default=0)
+    high = models.IntegerField(default=0)
+    medium = models.IntegerField(default=0)
+    low = models.IntegerField(default=0)
+    info = models.IntegerField(default=0)
     
-    critical = models.IntegerField(
-        default=0,
-        help_text="Number of critical severity vulnerabilities"
-    )
+    # Total scan duration in human-readable format
+    duration = models.CharField(max_length=50, null=True, blank=True)
     
-    high = models.IntegerField(
-        default=0,
-        help_text="Number of high severity vulnerabilities"
-    )
-    
-    medium = models.IntegerField(
-        default=0,
-        help_text="Number of medium severity vulnerabilities"
-    )
-    
-    low = models.IntegerField(
-        default=0,
-        help_text="Number of low severity vulnerabilities"
-    )
-    
-    info = models.IntegerField(
-        default=0,
-        help_text="Number of informational findings"
-    )
-    
-    duration = models.CharField(
-        max_length=50, 
-        null=True, 
-        blank=True,
-        help_text="Total scan duration in human-readable format"
-    )
-    
+    # Array of vulnerability IDs included in this report
+    # INT[] in SQL → ArrayField(IntegerField)
     vulnerabilities = ArrayField(
         base_field=models.IntegerField(),
         default=list,
         blank=True,
-        help_text="List of vulnerability IDs included in this report"
     )
     
-    download_link = models.CharField(
-        max_length=255, 
-        null=True, 
-        blank=True,
-        help_text="URL or path to downloadable report file"
-    )
+    # URL or path to downloadable report file (PDF, etc.)
+    download_link = models.CharField(max_length=255, null=True, blank=True)
     
-    generated_at = models.DateTimeField(
-        auto_now_add=True,
-        help_text="Timestamp when report was generated"
-    )
+    # Timestamp when report was generated
+    generated_at = models.DateTimeField(auto_now_add=True)  # DEFAULT NOW()
 
     def __str__(self):
-        """Human-readable representation of the report."""
+        """Human-readable string representation."""
         return f"Report for Scan #{self.scan_id}"
 
     class Meta:
-        """Metadata options for the Report model."""
+        """Metadata options for Report model."""
         verbose_name = "Scan Report"
         verbose_name_plural = "Scan Reports"
         ordering = ['-generated_at']
@@ -445,63 +240,34 @@ class Note(models.Model):
     Enables collaboration and knowledge sharing by allowing users
     to add context, observations, and follow-up information to
     specific vulnerabilities.
-    
-    Relationships:
-    - Many-to-One with Vulnerability: Notes belong to a specific vulnerability
-    - Many-to-One with User: Notes are created by specific users
-    
-    Fields:
-    - content: Text content of the note
-    - Automatic timestamp for creation tracking
     """
     
-    vuln = models.ForeignKey(
-        Vulnerability, 
-        on_delete=models.CASCADE, 
-        related_name="notes",
-        help_text="Vulnerability this note is associated with"
-    )
+    # Many-to-one relationship with Vulnerability
+    vuln = models.ForeignKey(Vulnerability, on_delete=models.CASCADE, related_name="notes")
     
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
-        on_delete=models.CASCADE,
-        help_text="User who created this note"
-    )
+    # Many-to-one relationship with User - notes are created by users
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     
-    content = models.TextField(
-        help_text="Text content of the note or comment"
-    )
+    # Text content of the note or comment
+    content = models.TextField()
     
-    created_at = models.DateTimeField(
-        auto_now_add=True,
-        help_text="Timestamp when note was created"
-    )
+    # Timestamp when note was created
+    created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        """Human-readable representation of the note."""
+        """Human-readable string representation."""
         return f"Note by {self.user} on Vuln #{self.vuln_id}"
 
     class Meta:
-        """Metadata options for the Note model."""
+        """Metadata options for Note model."""
         verbose_name = "Vulnerability Note"
         verbose_name_plural = "Vulnerability Notes"
         ordering = ['-created_at']  # Most recent notes first
-        indexes = [
-            models.Index(fields=['vuln', 'created_at']),
-        ]
 
 
 """
-Database Schema Overview:
+Database Schema Relationships:
 
-Tables:
-1. scans_scan           - Master scan sessions
-2. scans_scanresult     - Detailed technical results (JSONB)
-3. scans_vulnerability  - Individual security findings  
-4. scans_report         - Aggregated results for reporting
-5. scans_note           - User annotations on vulnerabilities
-
-Key Relationships:
 Scan (1) ───── (1) ScanResult
    │
    │ (1)
@@ -514,28 +280,22 @@ Vulnerability (1) ───── (N) Note
    ▼
 Report (includes vulnerability IDs)
 
-PostgreSQL-Specific Features:
-- JSONB fields in ScanResult for flexible data storage
-- ArrayField for reference_links and vulnerabilities lists
-- Automatic indexes on foreign keys
-- DateTime fields with timezone support
+Key Design Decisions:
+1. JSONB fields in ScanResult allow flexible storage of varying scan data
+2. ArrayField for reference_links enables efficient storage of URL lists
+3. Separate Report model aggregates data for presentation layer
+4. Note model supports collaborative vulnerability management
+5. All models include created_at for audit trail
 
 Performance Considerations:
-- Large scan results may require partitioning for very high volume
-- JSONB fields are indexed for query performance
-- Consider materialized views for complex report aggregations
-- Regular vacuum and analyze for optimal performance
+- Foreign key indexes are automatically created by Django
+- JSONB fields support efficient querying of nested data
+- ArrayField provides better performance than many-to-many for simple lists
+- DateTime fields with timezone support for accurate timestamping
 
-Migration Strategy:
-- Use Django migrations for schema evolution
-- Test with production-like data volumes
-- Consider data migration strategies for schema changes
-- Use --dry-run to preview migration changes
-
-Security Considerations:
-- User data isolation via foreign key constraints
-- Input validation at API level before database storage
-- Regular security updates for Django and PostgreSQL
-- Backup and recovery procedures for scan data
+Migration Safety:
+- No changes to existing field definitions
+- Only comments and documentation added
+- All existing data relationships preserved
+- No database schema modifications required
 """
-```
