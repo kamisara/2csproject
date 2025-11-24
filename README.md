@@ -34,12 +34,12 @@ cd vulnscan
 docker-compose up -d
 
 # Access the application
-# Frontend: http://localhost:5173
-# Backend API: http://localhost:8000
+Frontend: http://localhost:5173
+Backend API: http://localhost:8000
 
-###Manual Development Setup
+### Manual Development Setup
 
-##Backend Setup
+## Backend Setup
 cd backend
 
 # Create virtual environment
@@ -59,7 +59,7 @@ python manage.py migrate
 # Start development server
 python manage.py runserver
 
-##Frontend Setup
+## Frontend Setup
 cd frontend
 
 # Install dependencies
