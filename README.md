@@ -94,7 +94,7 @@ worker: Celery worker for background tasks
 db: PostgreSQL database
 
 👥 Development Team
-Sara Madaoui - Team Lead & Backend Development
+Sara Madaoui - Team Lead & Backend Development & Scanning Engine & Integration & Backend API
 
 Roufaida Madoui - Scanning Engine & Integration
 
